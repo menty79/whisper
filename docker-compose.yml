@@ -18,6 +18,11 @@ services:
       - WHISPER_LOCAL_FILES_ONLY=true
     volumes:
       - ./config:/models
+      - n8n_work:/work
     ports:
       - 10300:10300
     restart: unless-stopped
+
+volumes:
+  n8n_work:
+    external: true

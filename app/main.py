@@ -1,7 +1,10 @@
+import hashlib
+import json
 import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -9,6 +12,7 @@ from typing import Any
 from av.error import InvalidDataError
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from faster_whisper import WhisperModel
+from pydantic import BaseModel, Field
 
 
 logging.basicConfig(
@@ -42,9 +46,20 @@ LOCAL_FILES_ONLY = os.getenv("WHISPER_LOCAL_FILES_ONLY", "false").strip().lower(
     "yes",
     "on",
 }
+WORK_ROOT = Path(os.getenv("WHISPER_WORK_DIR", "/work/transcripts/by-video"))
+PIPELINE_VERSION = os.getenv("WHISPER_PIPELINE_VERSION", "1")
 
 _MODEL_LOCK = Lock()
 _MODELS: dict[str, WhisperModel] = {}
+
+
+class WhisperJobRequest(BaseModel):
+    video_id: str = Field(..., min_length=3)
+    model: str = DEFAULT_MODEL
+    language_mode: str = "auto"
+    language: str | None = None
+    chunk_seconds: int = Field(150, ge=30, le=1800)
+    retry_errors: bool = False
 
 
 def _candidate_model_dirs(model_name: str) -> list[Path]:
@@ -117,9 +132,63 @@ def _segment_payload(segment: Any) -> dict[str, Any]:
     }
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _fingerprint(
+    video_id: str,
+    model: str,
+    language_mode: str,
+    language: str | None,
+    chunk_seconds: int,
+) -> str:
+    lang_tag = f"{language_mode}:{language or '-'}"
+    blob = f"{video_id}|{model}|{lang_tag}|{chunk_seconds}|v{PIPELINE_VERSION}"
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _job_dir(job_id: str) -> Path:
+    return WORK_ROOT / job_id
+
+
+def _job_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "job.json"
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
+        handle.write("\n")
+    tmp.replace(path)
+
+
+def _public_job_payload(job: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "heartbeat_at": job.get("heartbeat_at"),
+    }
+    if job.get("result") is not None:
+        payload["result"] = job["result"]
+    if job.get("error") is not None:
+        payload["error"] = job["error"]
+    return payload
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Path(MODEL_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+    WORK_ROOT.mkdir(parents=True, exist_ok=True)
     if PRELOAD_MODEL:
         _get_model(DEFAULT_MODEL)
     yield
@@ -135,7 +204,78 @@ async def health() -> dict[str, Any]:
         "default_model": DEFAULT_MODEL,
         "loaded_models": sorted(_MODELS.keys()),
         "cache_dir": MODEL_CACHE_DIR,
+        "work_dir": str(WORK_ROOT),
     }
+
+
+@app.post("/jobs/whisper")
+async def enqueue_whisper_job(request: WhisperJobRequest) -> dict[str, Any]:
+    if request.language_mode not in {"auto", "fixed"}:
+        raise HTTPException(
+            status_code=400,
+            detail="language_mode must be auto or fixed",
+        )
+    if request.language_mode == "fixed" and not _normalized_language(request.language):
+        raise HTTPException(
+            status_code=400,
+            detail="language is required when language_mode is fixed",
+        )
+
+    language = _normalized_language(request.language)
+    job_id = _fingerprint(
+        request.video_id,
+        request.model,
+        request.language_mode,
+        language,
+        request.chunk_seconds,
+    )
+    path = _job_path(job_id)
+
+    if path.exists():
+        job = _read_json(path)
+        error = job.get("error") or {}
+        if (
+            request.retry_errors
+            and job.get("status") == "error"
+            and error.get("recoverable", False)
+        ):
+            job["status"] = "queued"
+            job["updated_at"] = _now_iso()
+            job["queued_at"] = _now_iso()
+            job["heartbeat_at"] = None
+            job["error"] = None
+            _atomic_write_json(path, job)
+        return _public_job_payload(job)
+
+    now = _now_iso()
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "queued_at": now,
+        "heartbeat_at": None,
+        "pipeline_version": PIPELINE_VERSION,
+        "request": {
+            "video_id": request.video_id,
+            "model": request.model,
+            "language_mode": request.language_mode,
+            "language": language,
+            "chunk_seconds": request.chunk_seconds,
+        },
+        "result": None,
+        "error": None,
+    }
+    _atomic_write_json(path, job)
+    return _public_job_payload(job)
+
+
+@app.get("/jobs/{job_id}")
+async def get_whisper_job(job_id: str) -> dict[str, Any]:
+    path = _job_path(job_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="job not found")
+    return _public_job_payload(_read_json(path))
 
 
 @app.post("/audio")
