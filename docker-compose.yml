@@ -1,0 +1,23 @@
+services:
+  faster-whisper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: faster-whisper
+    environment:
+      - TZ=Europe/Berlin
+      - WHISPER_MODEL=large-v3
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_BEAM=5
+      - WHISPER_LANG=auto
+      - WHISPER_VAD=true
+      - WHISPER_CPU_THREADS=4
+      - WHISPER_PRELOAD=true
+      - WHISPER_CACHE_DIR=/models
+      - WHISPER_LOCAL_FILES_ONLY=true
+    volumes:
+      - ./config:/models
+    ports:
+      - 10300:10300
+    restart: unless-stopped
